@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: kalshi-bot
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app
+    envVars:
+      - key: KALSHI_API_KEY
+        sync: false
+      - key: WEBHOOK_SECRET
+        value: kalshi_bot_secret
+      - key: DEFAULT_QUANTITY
+        value: 25
