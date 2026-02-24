@@ -16,10 +16,9 @@ app = Flask(__name__)
 KALSHI_API_KEY   = os.getenv("KALSHI_API_KEY", "")
 KALSHI_BASE_URL  = "https://api.elections.kalshi.com/trade-api/v2"
 WEBHOOK_SECRET   = os.getenv("WEBHOOK_SECRET", "kalshi_bot_secret")
-DEFAULT_QUANTITY = int(os.getenv("DEFAULT_QUANTITY", "25"))
+DEFAULT_QUANTITY = int(os.getenv("DEFAULT_QUANTITY", "1"))
 
 # ─── YOUR APPROVED SCHEDULE ───────────────────────────────
-# Based on your 7-week backtest analysis
 APPROVED_HOURS = {
     "Monday":    [7, 9, 10, 12, 17, 18, 19, 22],
     "Tuesday":   [8, 9, 10, 17, 19, 22],
@@ -30,36 +29,32 @@ APPROVED_HOURS = {
     "Sunday":    [9, 10, 12, 13, 17, 18, 19, 22],
 }
 
-# ─── BID FORMULA (your exact logic) ───────────────────────
+# ─── BID FORMULA ───────────────────────────────────────────
 def calculate_bid(engine_a: float, engine_b: float, vol_ratio: float) -> float:
     avg = (engine_a + engine_b) / 2.0
 
-    # Your margin subtraction scale
-    if avg < 35:
+    if avg <= 30:
         margin = 15
-    elif avg < 45:
+    elif avg <= 40:
         margin = 17
-    elif avg < 55:
+    elif avg <= 50:
         margin = 19
-    elif avg < 65:
+    elif avg <= 60:
         margin = 21
+    elif avg <= 70:
+        margin = 23
     else:
         margin = 23
 
     raw_bid = avg - margin
-
-    # Vol ratio adjustment
     vol_adjusted = raw_bid / vol_ratio if vol_ratio > 0 else raw_bid
     final_bid = min(vol_adjusted, raw_bid)
-
-    # Clamp to your 20c-60c range
-    final_bid = max(20.0, min(60.0, final_bid))
-    return round(final_bid) / 100.0  # return as decimal e.g. 0.37
+    final_bid = max(10.0, min(60.0, final_bid))
+    return round(final_bid) / 100.0
 
 # ─── SCHEDULE CHECK ───────────────────────────────────────
 def is_approved_hour(day_name: str, hour: int) -> bool:
-    approved = APPROVED_HOURS.get(day_name, [])
-    return hour in approved
+    return hour in APPROVED_HOURS.get(day_name, [])
 
 # ─── KALSHI API ───────────────────────────────────────────
 def get_kalshi_headers():
@@ -68,21 +63,14 @@ def get_kalshi_headers():
         "Content-Type": "application/json",
     }
 
-def find_market(ticker_base: str, target_price: float, side: str, current_hour: int):
-    """Find relevant Kalshi markets for this hour"""
+def find_market(ticker_base: str, target_price: float, current_hour: int):
     try:
-        # Search for markets matching this asset and hour
         url = f"{KALSHI_BASE_URL}/markets"
-        params = {
-            "tickers": ticker_base,
-            "status": "open",
-            "limit": 20
-        }
+        params = {"tickers": ticker_base, "status": "open", "limit": 20}
         resp = requests.get(url, headers=get_kalshi_headers(), params=params, timeout=10)
         if resp.status_code != 200:
             logger.error(f"Market search failed: {resp.text}")
             return []
-        
         markets = resp.json().get("markets", [])
         logger.info(f"Found {len(markets)} markets for {ticker_base}")
         return markets
@@ -91,7 +79,6 @@ def find_market(ticker_base: str, target_price: float, side: str, current_hour: 
         return []
 
 def place_order(ticker: str, side: str, bid_price: float, quantity: int):
-    """Place a limit order on Kalshi"""
     try:
         url = f"{KALSHI_BASE_URL}/portfolio/orders"
         payload = {
@@ -123,70 +110,42 @@ def log_trade(data):
     if len(trade_log) > 100:
         trade_log.pop()
 
-# ─── WEBHOOK ENDPOINT ─────────────────────────────────────
+# ─── WEBHOOK ──────────────────────────────────────────────
 @app.route("/webhook", methods=["POST"])
 def webhook():
     try:
         data = request.get_json(force=True)
         logger.info(f"Webhook received: {data}")
 
-        # Validate secret
         if data.get("secret") != WEBHOOK_SECRET:
             return jsonify({"error": "unauthorized"}), 401
 
-        # Extract values from TradingView alert
         engine_a  = float(data.get("engineA", 0))
         engine_b  = float(data.get("engineB", 0))
         vol_ratio = float(data.get("volRatio", 1.0))
-        asset     = data.get("asset", "BTC").upper()  # "BTC" or "ETH"
+        asset     = data.get("asset", "BTC").upper()
         price     = float(data.get("price", 0))
 
-        # Get current day/hour in EST
         now      = datetime.now()
         day_name = now.strftime("%A")
         hour     = now.hour
 
-        # Check schedule
         if not is_approved_hour(day_name, hour):
-            msg = f"⏭ Skipped {day_name} {hour:02d}:00 — not in approved schedule"
-            logger.info(msg)
-            log_trade({"status": "skipped", "reason": f"{day_name} {hour:02d}:00 not approved", "asset": asset})
+            msg = f"Skipped {day_name} {hour:02d}:00 — not in approved schedule"
+            log_trade({"status": "skipped", "reason": msg, "asset": asset})
             return jsonify({"status": "skipped", "reason": msg})
 
-        # Calculate bid
         bid = calculate_bid(engine_a, engine_b, vol_ratio)
-
-        # Check bid is in valid range
-        if bid < 0.20 or bid > 0.60:
-            msg = f"⏭ Bid {bid:.2f} out of range"
-            logger.info(msg)
-            log_trade({"status": "skipped", "reason": f"bid {bid:.2f} out of range", "asset": asset})
-            return jsonify({"status": "skipped", "reason": msg})
-
         logger.info(f"📊 {asset} | EngA:{engine_a}% EngB:{engine_b}% | Bid:{bid:.2f} | {day_name} {hour:02d}:00")
 
-        # Determine ticker base
         ticker_base = "KXBTCD" if asset == "BTC" else "KXETHD"
-
-        # Find available markets
-        markets = find_market(ticker_base, price, "yes", hour)
-
+        markets = find_market(ticker_base, price, hour)
         orders_placed = []
 
         if not markets:
-            # Log attempt even if no markets found
-            log_trade({
-                "status": "no_markets",
-                "asset": asset,
-                "engineA": engine_a,
-                "engineB": engine_b,
-                "bid": f"{bid:.2f}",
-                "day": day_name,
-                "hour": f"{hour:02d}:00"
-            })
+            log_trade({"status": "no_markets", "asset": asset, "engineA": engine_a, "engineB": engine_b, "bid": f"{bid:.2f}", "day": day_name, "hour": f"{hour:02d}:00"})
             return jsonify({"status": "no_markets_found", "bid": bid})
 
-        # Place YES and NO bracket orders on up to 3 markets each side
         yes_markets = [m for m in markets if float(m.get("yes_ask", 1)) <= bid + 0.05][:3]
         no_markets  = [m for m in markets if float(m.get("no_ask", 1)) <= bid + 0.05][:3]
 
@@ -198,24 +157,8 @@ def webhook():
             result = place_order(m["ticker"], "no", bid, DEFAULT_QUANTITY)
             orders_placed.append({"ticker": m["ticker"], "side": "no", "bid": bid, "result": result})
 
-        log_trade({
-            "status": "orders_placed",
-            "asset": asset,
-            "engineA": engine_a,
-            "engineB": engine_b,
-            "volRatio": vol_ratio,
-            "bid": f"${bid:.2f}",
-            "day": day_name,
-            "hour": f"{hour:02d}:00",
-            "orders": len(orders_placed)
-        })
-
-        return jsonify({
-            "status": "success",
-            "bid": bid,
-            "orders_placed": len(orders_placed),
-            "details": orders_placed
-        })
+        log_trade({"status": "orders_placed", "asset": asset, "engineA": engine_a, "engineB": engine_b, "volRatio": vol_ratio, "bid": f"${bid:.2f}", "day": day_name, "hour": f"{hour:02d}:00", "orders": len(orders_placed)})
+        return jsonify({"status": "success", "bid": bid, "orders_placed": len(orders_placed), "details": orders_placed})
 
     except Exception as e:
         logger.error(f"Webhook error: {e}")
@@ -258,15 +201,12 @@ DASHBOARD_HTML = """
 <body>
 <div class="title">KALSHI BOT</div>
 <div class="sub"><span class="status-dot"></span>LIVE · AUTO-TRADING ACTIVE</div>
-
 <div class="stats">
   <div class="stat"><div class="stat-n">{{ total_orders }}</div><div class="stat-l">ORDERS TODAY</div></div>
   <div class="stat"><div class="stat-n">{{ total_skipped }}</div><div class="stat-l">SKIPPED</div></div>
   <div class="stat"><div class="stat-n">{{ quantity }}</div><div class="stat-l">CONTRACTS</div></div>
 </div>
-
 <div class="section">RECENT ACTIVITY</div>
-
 {% for trade in trades %}
 <div class="log-item">
   <div class="log-header">
@@ -287,11 +227,9 @@ DASHBOARD_HTML = """
   </div>
 </div>
 {% endfor %}
-
 {% if not trades %}
 <div class="log-item"><div class="log-detail" style="text-align:center;padding:8px 0;">No activity yet — waiting for TradingView alerts</div></div>
 {% endif %}
-
 <div class="refresh"><a href="/">↻ REFRESH</a></div>
 </body>
 </html>
@@ -301,12 +239,7 @@ DASHBOARD_HTML = """
 def dashboard():
     total_orders  = sum(1 for t in trade_log if t.get("status") == "orders_placed")
     total_skipped = sum(1 for t in trade_log if t.get("status") == "skipped")
-    return render_template_string(DASHBOARD_HTML,
-        trades=trade_log[:20],
-        total_orders=total_orders,
-        total_skipped=total_skipped,
-        quantity=DEFAULT_QUANTITY
-    )
+    return render_template_string(DASHBOARD_HTML, trades=trade_log[:20], total_orders=total_orders, total_skipped=total_skipped, quantity=DEFAULT_QUANTITY)
 
 @app.route("/health")
 def health():
