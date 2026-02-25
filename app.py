@@ -3,9 +3,13 @@ import requests
 import os
 import time
 import threading
+import base64
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 import logging
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import padding
+from cryptography.hazmat.backends import default_backend
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
@@ -14,10 +18,11 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 
 # ─── CONFIG ───────────────────────────────────────────────
-KALSHI_API_KEY   = os.getenv("KALSHI_API_KEY", "")
-KALSHI_BASE_URL  = "https://api.elections.kalshi.com/trade-api/v2"
-WEBHOOK_SECRET   = os.getenv("WEBHOOK_SECRET", "kalshi_bot_secret")
-DEFAULT_QUANTITY = int(os.getenv("DEFAULT_QUANTITY", "1"))
+KALSHI_API_KEY_ID  = os.getenv("KALSHI_API_KEY_ID", "")
+KALSHI_PRIVATE_KEY = os.getenv("KALSHI_PRIVATE_KEY", "")
+KALSHI_BASE_URL    = "https://api.elections.kalshi.com/trade-api/v2"
+WEBHOOK_SECRET     = os.getenv("WEBHOOK_SECRET", "kalshi_bot_secret")
+DEFAULT_QUANTITY   = int(os.getenv("DEFAULT_QUANTITY", "1"))
 
 # ─── APPROVED SCHEDULE (EST) ──────────────────────────────
 APPROVED_HOURS = {
@@ -53,18 +58,41 @@ def calculate_bid(engine_a: float, engine_b: float, vol_ratio: float) -> float:
 def is_approved_hour(day_name: str, hour_est: int) -> bool:
     return hour_est in APPROVED_HOURS.get(day_name, [])
 
-# ─── KALSHI API ───────────────────────────────────────────
-def get_kalshi_headers():
+# ─── KALSHI RSA AUTH ──────────────────────────────────────
+def get_kalshi_headers(method: str, path: str) -> dict:
+    timestamp_ms = str(int(datetime.utcnow().timestamp() * 1000))
+    msg_string = timestamp_ms + method.upper() + path
+
+    private_key = serialization.load_pem_private_key(
+        KALSHI_PRIVATE_KEY.encode(),
+        password=None,
+        backend=default_backend()
+    )
+    signature = private_key.sign(
+        msg_string.encode("utf-8"),
+        padding.PKCS1v15(),
+        hashes.SHA256()
+    )
+    sig_b64 = base64.b64encode(signature).decode("utf-8")
+
     return {
-        "Authorization": f"Bearer {KALSHI_API_KEY}",
-        "Content-Type": "application/json",
+        "KALSHI-ACCESS-KEY":       KALSHI_API_KEY_ID,
+        "KALSHI-ACCESS-SIGNATURE": sig_b64,
+        "KALSHI-ACCESS-TIMESTAMP": timestamp_ms,
+        "Content-Type":            "application/json",
     }
 
+# ─── KALSHI API ───────────────────────────────────────────
 def find_markets(ticker_base: str):
     try:
-        url = f"{KALSHI_BASE_URL}/markets"
+        path = "/trade-api/v2/markets"
         params = {"series_ticker": ticker_base, "status": "open", "limit": 100}
-        resp = requests.get(url, headers=get_kalshi_headers(), params=params, timeout=10)
+        resp = requests.get(
+            KALSHI_BASE_URL + "/markets",
+            headers=get_kalshi_headers("GET", path),
+            params=params,
+            timeout=10
+        )
         if resp.status_code != 200:
             logger.error(f"Market search failed: {resp.status_code} {resp.text}")
             return []
@@ -80,7 +108,7 @@ def find_markets(ticker_base: str):
 
 def place_order(ticker: str, side: str, bid_price: float, quantity: int):
     try:
-        url = f"{KALSHI_BASE_URL}/portfolio/orders"
+        path = "/trade-api/v2/portfolio/orders"
         payload = {
             "ticker": ticker,
             "client_order_id": f"bot_{ticker}_{int(datetime.now().timestamp())}",
@@ -91,7 +119,12 @@ def place_order(ticker: str, side: str, bid_price: float, quantity: int):
             "yes_price": int(bid_price * 100) if side == "yes" else int((1 - bid_price) * 100),
             "no_price":  int((1 - bid_price) * 100) if side == "yes" else int(bid_price * 100),
         }
-        resp = requests.post(url, headers=get_kalshi_headers(), json=payload, timeout=10)
+        resp = requests.post(
+            KALSHI_BASE_URL + "/portfolio/orders",
+            headers=get_kalshi_headers("POST", path),
+            json=payload,
+            timeout=10
+        )
         if resp.status_code in [200, 201]:
             logger.info(f"✅ Order placed: {ticker} {side} @ {bid_price}")
             return {"success": True, "order": resp.json()}
@@ -133,7 +166,7 @@ def execute_trade(asset, price, bid, day_name, est_hour, engine_a, engine_b, vol
          and float(m["floor_strike"]) < price
          and float(m.get("yes_ask", 100)) <= bid * 100],
         key=lambda m: float(m["floor_strike"]),
-        reverse=True  # closest below price first
+        reverse=True
     )[:3]
 
     # NO = strikes ABOVE current price (betting price stays below that ceiling)
@@ -141,7 +174,7 @@ def execute_trade(asset, price, bid, day_name, est_hour, engine_a, engine_b, vol
         [m for m in markets if m.get("floor_strike") is not None
          and float(m["floor_strike"]) > price
          and float(m.get("no_ask", 100)) <= bid * 100],
-        key=lambda m: float(m["floor_strike"])  # closest above price first
+        key=lambda m: float(m["floor_strike"])
     )[:3]
 
     logger.info(f"YES markets: {len(yes_markets)} | NO markets: {len(no_markets)}")
@@ -194,18 +227,15 @@ def webhook():
 
         logger.info(f"EST time: {day_name} {est_hour:02d}:00")
 
-        # Check schedule
         if not is_approved_hour(day_name, est_hour):
             msg = f"⏭ Skipped {day_name} {est_hour:02d}:00 EST — not approved"
             logger.info(msg)
             log_trade({"status": "skipped", "reason": msg, "asset": asset})
             return jsonify({"status": "skipped", "reason": msg})
 
-        # Calculate bid
         bid = calculate_bid(engine_a, engine_b, vol_ratio)
         logger.info(f"📊 {asset} | EngA:{engine_a}% EngB:{engine_b}% | Bid:${bid:.2f} | {day_name} {est_hour:02d}:00 EST")
 
-        # Fire and forget — background thread handles retries
         t = threading.Thread(target=execute_trade, args=(asset, price, bid, day_name, est_hour, engine_a, engine_b, vol_ratio))
         t.daemon = True
         t.start()
