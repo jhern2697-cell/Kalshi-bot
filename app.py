@@ -2,6 +2,7 @@ from flask import Flask, request, jsonify, render_template_string
 import requests
 import os
 import time
+import threading
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 import logging
@@ -60,7 +61,6 @@ def get_kalshi_headers():
     }
 
 def find_markets(ticker_base: str):
-    """Fetch all open markets for this asset with debug logging"""
     try:
         url = f"{KALSHI_BASE_URL}/markets"
         params = {"tickers": ticker_base, "status": "open", "limit": 50}
@@ -79,7 +79,6 @@ def find_markets(ticker_base: str):
         return []
 
 def place_order(ticker: str, side: str, bid_price: float, quantity: int):
-    """Place a limit order on Kalshi"""
     try:
         url = f"{KALSHI_BASE_URL}/portfolio/orders"
         payload = {
@@ -111,6 +110,62 @@ def log_trade(data):
     if len(trade_log) > 100:
         trade_log.pop()
 
+# ─── BACKGROUND TRADE EXECUTION ───────────────────────────
+def execute_trade(asset, price, bid, day_name, est_hour, engine_a, engine_b, vol_ratio):
+    """Runs in background thread — retries market search up to 3 times"""
+    ticker_base = "KXBTCD" if asset == "BTC" else "KXETHD"
+    markets = []
+
+    for attempt in range(3):
+        markets = find_markets(ticker_base)
+        if markets:
+            break
+        logger.info(f"No markets yet for {asset}, retry {attempt + 1}/3 in 2 minutes...")
+        time.sleep(120)
+
+    if not markets:
+        logger.info(f"No markets found for {asset} after 3 attempts")
+        log_trade({"status": "no_markets", "asset": asset, "bid": f"${bid:.2f}", "day": day_name, "hour": f"{est_hour:02d}:00"})
+        return
+
+    # YES = strikes BELOW current price
+    yes_markets = sorted(
+        [m for m in markets if float(m.get("strike_value", m.get("cap_strike", m.get("floor_strike", 0)))) < price
+         and float(m.get("yes_ask", 100)) / 100.0 <= bid + 0.05],
+        key=lambda m: float(m.get("strike_value", m.get("cap_strike", m.get("floor_strike", 0)))),
+        reverse=True
+    )[:3]
+
+    # NO = strikes ABOVE current price
+    no_markets = sorted(
+        [m for m in markets if float(m.get("strike_value", m.get("cap_strike", m.get("floor_strike", 0)))) > price
+         and float(m.get("no_ask", 100)) / 100.0 <= bid + 0.05],
+        key=lambda m: float(m.get("strike_value", m.get("cap_strike", m.get("floor_strike", 0))))
+    )[:3]
+
+    logger.info(f"YES markets: {len(yes_markets)} | NO markets: {len(no_markets)}")
+
+    orders_placed = []
+    for m in yes_markets:
+        result = place_order(m["ticker"], "yes", bid, DEFAULT_QUANTITY)
+        orders_placed.append({"ticker": m["ticker"], "side": "yes", "bid": bid, "result": result})
+
+    for m in no_markets:
+        result = place_order(m["ticker"], "no", bid, DEFAULT_QUANTITY)
+        orders_placed.append({"ticker": m["ticker"], "side": "no", "bid": bid, "result": result})
+
+    log_trade({
+        "status": "orders_placed",
+        "asset": asset,
+        "engineA": engine_a,
+        "engineB": engine_b,
+        "volRatio": vol_ratio,
+        "bid": f"${bid:.2f}",
+        "day": day_name,
+        "hour": f"{est_hour:02d}:00",
+        "orders": len(orders_placed)
+    })
+
 # ─── WEBHOOK ENDPOINT ─────────────────────────────────────
 @app.route("/webhook", methods=["POST"])
 def webhook():
@@ -127,7 +182,7 @@ def webhook():
         asset     = data.get("asset", "BTC").upper()
         price     = float(data.get("price", 0))
 
-        # Convert UTC to EST for schedule check
+        # Convert UTC to EST
         now_utc  = datetime.utcnow()
         est_hour = (now_utc.hour - 5) % 24
         if now_utc.hour < 5:
@@ -149,61 +204,12 @@ def webhook():
         bid = calculate_bid(engine_a, engine_b, vol_ratio)
         logger.info(f"📊 {asset} | EngA:{engine_a}% EngB:{engine_b}% | Bid:${bid:.2f} | {day_name} {est_hour:02d}:00 EST")
 
-        ticker_base = "KXBTCD" if asset == "BTC" else "KXETHD"
+        # Fire and forget — background thread handles retries
+        t = threading.Thread(target=execute_trade, args=(asset, price, bid, day_name, est_hour, engine_a, engine_b, vol_ratio))
+        t.daemon = True
+        t.start()
 
-        # Retry up to 3 times — Kalshi may not post markets until ~2 min after hour
-        markets = []
-        for attempt in range(3):
-            markets = find_markets(ticker_base)
-            if markets:
-                break
-            logger.info(f"No markets yet, retry {attempt + 1}/3 in 2 minutes...")
-            time.sleep(120)
-
-        orders_placed = []
-
-        if not markets:
-            log_trade({"status": "no_markets", "asset": asset, "bid": f"${bid:.2f}", "day": day_name, "hour": f"{est_hour:02d}:00"})
-            return jsonify({"status": "no_markets_found", "bid": bid})
-
-        # YES = strikes BELOW current price (betting price stays above that floor)
-        yes_markets = sorted(
-            [m for m in markets if float(m.get("strike_value", m.get("cap_strike", m.get("floor_strike", 0)))) < price
-             and float(m.get("yes_ask", 100)) / 100.0 <= bid + 0.05],
-            key=lambda m: float(m.get("strike_value", m.get("cap_strike", m.get("floor_strike", 0)))),
-            reverse=True
-        )[:3]
-
-        # NO = strikes ABOVE current price (betting price stays below that ceiling)
-        no_markets = sorted(
-            [m for m in markets if float(m.get("strike_value", m.get("cap_strike", m.get("floor_strike", 0)))) > price
-             and float(m.get("no_ask", 100)) / 100.0 <= bid + 0.05],
-            key=lambda m: float(m.get("strike_value", m.get("cap_strike", m.get("floor_strike", 0))))
-        )[:3]
-
-        logger.info(f"YES markets found: {len(yes_markets)} | NO markets found: {len(no_markets)}")
-
-        for m in yes_markets:
-            result = place_order(m["ticker"], "yes", bid, DEFAULT_QUANTITY)
-            orders_placed.append({"ticker": m["ticker"], "side": "yes", "bid": bid, "result": result})
-
-        for m in no_markets:
-            result = place_order(m["ticker"], "no", bid, DEFAULT_QUANTITY)
-            orders_placed.append({"ticker": m["ticker"], "side": "no", "bid": bid, "result": result})
-
-        log_trade({
-            "status": "orders_placed",
-            "asset": asset,
-            "engineA": engine_a,
-            "engineB": engine_b,
-            "volRatio": vol_ratio,
-            "bid": f"${bid:.2f}",
-            "day": day_name,
-            "hour": f"{est_hour:02d}:00",
-            "orders": len(orders_placed)
-        })
-
-        return jsonify({"status": "success", "bid": bid, "orders_placed": len(orders_placed), "details": orders_placed})
+        return jsonify({"status": "processing", "bid": bid, "asset": asset})
 
     except Exception as e:
         logger.error(f"Webhook error: {e}")
