@@ -1,7 +1,8 @@
 from flask import Flask, request, jsonify, render_template_string
 import requests
 import os
-from datetime import datetime
+import time
+from datetime import datetime, timedelta
 from dotenv import load_dotenv
 import logging
 
@@ -17,7 +18,7 @@ KALSHI_BASE_URL  = "https://api.elections.kalshi.com/trade-api/v2"
 WEBHOOK_SECRET   = os.getenv("WEBHOOK_SECRET", "kalshi_bot_secret")
 DEFAULT_QUANTITY = int(os.getenv("DEFAULT_QUANTITY", "1"))
 
-# ─── APPROVED SCHEDULE (EST hours) ────────────────────────
+# ─── APPROVED SCHEDULE (EST) ──────────────────────────────
 APPROVED_HOURS = {
     "Monday":    [7, 9, 10, 12, 17, 18, 19, 22],
     "Tuesday":   [8, 9, 10, 17, 19, 22],
@@ -47,7 +48,7 @@ def calculate_bid(engine_a: float, engine_b: float, vol_ratio: float) -> float:
     final_bid = max(10.0, min(60.0, final_bid))
     return round(final_bid) / 100.0
 
-# ─── SCHEDULE CHECK (uses EST) ────────────────────────────
+# ─── SCHEDULE CHECK (EST) ─────────────────────────────────
 def is_approved_hour(day_name: str, hour_est: int) -> bool:
     return hour_est in APPROVED_HOURS.get(day_name, [])
 
@@ -59,16 +60,19 @@ def get_kalshi_headers():
     }
 
 def find_markets(ticker_base: str):
-    """Fetch all open markets for this asset"""
+    """Fetch all open markets for this asset with debug logging"""
     try:
         url = f"{KALSHI_BASE_URL}/markets"
         params = {"tickers": ticker_base, "status": "open", "limit": 50}
         resp = requests.get(url, headers=get_kalshi_headers(), params=params, timeout=10)
         if resp.status_code != 200:
-            logger.error(f"Market search failed: {resp.text}")
+            logger.error(f"Market search failed: {resp.status_code} {resp.text}")
             return []
         markets = resp.json().get("markets", [])
         logger.info(f"Found {len(markets)} markets for {ticker_base}")
+        if markets:
+            logger.info(f"Sample market keys: {list(markets[0].keys())}")
+            logger.info(f"Sample market: {markets[0]}")
         return markets
     except Exception as e:
         logger.error(f"find_markets error: {e}")
@@ -123,17 +127,17 @@ def webhook():
         asset     = data.get("asset", "BTC").upper()
         price     = float(data.get("price", 0))
 
-        # Convert UTC hour from webhook to EST for schedule check
-        now_utc   = datetime.utcnow()
-        est_hour  = (now_utc.hour - 5) % 24
-        # If subtracting 5 rolls back to previous day
+        # Convert UTC to EST for schedule check
+        now_utc  = datetime.utcnow()
+        est_hour = (now_utc.hour - 5) % 24
         if now_utc.hour < 5:
-            from datetime import timedelta
-            est_dt = now_utc - timedelta(hours=5)
+            est_dt   = now_utc - timedelta(hours=5)
             day_name = est_dt.strftime("%A")
         else:
             day_name = now_utc.strftime("%A")
-        
+
+        logger.info(f"EST time: {day_name} {est_hour:02d}:00")
+
         # Check schedule
         if not is_approved_hour(day_name, est_hour):
             msg = f"⏭ Skipped {day_name} {est_hour:02d}:00 EST — not approved"
@@ -146,7 +150,16 @@ def webhook():
         logger.info(f"📊 {asset} | EngA:{engine_a}% EngB:{engine_b}% | Bid:${bid:.2f} | {day_name} {est_hour:02d}:00 EST")
 
         ticker_base = "KXBTCD" if asset == "BTC" else "KXETHD"
-        markets = find_markets(ticker_base)
+
+        # Retry up to 3 times — Kalshi may not post markets until ~2 min after hour
+        markets = []
+        for attempt in range(3):
+            markets = find_markets(ticker_base)
+            if markets:
+                break
+            logger.info(f"No markets yet, retry {attempt + 1}/3 in 2 minutes...")
+            time.sleep(120)
+
         orders_placed = []
 
         if not markets:
@@ -155,18 +168,20 @@ def webhook():
 
         # YES = strikes BELOW current price (betting price stays above that floor)
         yes_markets = sorted(
-            [m for m in markets if float(m.get("strike_value", m.get("cap_strike", 0))) < price
+            [m for m in markets if float(m.get("strike_value", m.get("cap_strike", m.get("floor_strike", 0)))) < price
              and float(m.get("yes_ask", 100)) / 100.0 <= bid + 0.05],
-            key=lambda m: float(m.get("strike_value", m.get("cap_strike", 0))),
-            reverse=True  # closest below price first
+            key=lambda m: float(m.get("strike_value", m.get("cap_strike", m.get("floor_strike", 0)))),
+            reverse=True
         )[:3]
 
         # NO = strikes ABOVE current price (betting price stays below that ceiling)
         no_markets = sorted(
-            [m for m in markets if float(m.get("strike_value", m.get("cap_strike", 0))) > price
+            [m for m in markets if float(m.get("strike_value", m.get("cap_strike", m.get("floor_strike", 0)))) > price
              and float(m.get("no_ask", 100)) / 100.0 <= bid + 0.05],
-            key=lambda m: float(m.get("strike_value", m.get("cap_strike", 0)))  # closest above price first
+            key=lambda m: float(m.get("strike_value", m.get("cap_strike", m.get("floor_strike", 0))))
         )[:3]
+
+        logger.info(f"YES markets found: {len(yes_markets)} | NO markets found: {len(no_markets)}")
 
         for m in yes_markets:
             result = place_order(m["ticker"], "yes", bid, DEFAULT_QUANTITY)
