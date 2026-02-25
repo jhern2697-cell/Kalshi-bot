@@ -63,7 +63,7 @@ def get_kalshi_headers():
 def find_markets(ticker_base: str):
     try:
         url = f"{KALSHI_BASE_URL}/markets"
-        params = {"tickers": ticker_base, "status": "open", "limit": 50}
+        params = {"series_ticker": ticker_base, "status": "open", "limit": 100}
         resp = requests.get(url, headers=get_kalshi_headers(), params=params, timeout=10)
         if resp.status_code != 200:
             logger.error(f"Market search failed: {resp.status_code} {resp.text}")
@@ -112,7 +112,6 @@ def log_trade(data):
 
 # ─── BACKGROUND TRADE EXECUTION ───────────────────────────
 def execute_trade(asset, price, bid, day_name, est_hour, engine_a, engine_b, vol_ratio):
-    """Runs in background thread — retries market search up to 3 times"""
     ticker_base = "KXBTCD" if asset == "BTC" else "KXETHD"
     markets = []
 
@@ -128,19 +127,21 @@ def execute_trade(asset, price, bid, day_name, est_hour, engine_a, engine_b, vol
         log_trade({"status": "no_markets", "asset": asset, "bid": f"${bid:.2f}", "day": day_name, "hour": f"{est_hour:02d}:00"})
         return
 
-    # YES = strikes BELOW current price
+    # YES = strikes BELOW current price (betting price stays above that floor)
     yes_markets = sorted(
-        [m for m in markets if float(m.get("strike_value", m.get("cap_strike", m.get("floor_strike", 0)))) < price
-         and float(m.get("yes_ask", 100)) / 100.0 <= bid + 0.05],
-        key=lambda m: float(m.get("strike_value", m.get("cap_strike", m.get("floor_strike", 0)))),
-        reverse=True
+        [m for m in markets if m.get("floor_strike") is not None
+         and float(m["floor_strike"]) < price
+         and float(m.get("yes_ask", 100)) <= bid * 100],
+        key=lambda m: float(m["floor_strike"]),
+        reverse=True  # closest below price first
     )[:3]
 
-    # NO = strikes ABOVE current price
+    # NO = strikes ABOVE current price (betting price stays below that ceiling)
     no_markets = sorted(
-        [m for m in markets if float(m.get("strike_value", m.get("cap_strike", m.get("floor_strike", 0)))) > price
-         and float(m.get("no_ask", 100)) / 100.0 <= bid + 0.05],
-        key=lambda m: float(m.get("strike_value", m.get("cap_strike", m.get("floor_strike", 0))))
+        [m for m in markets if m.get("floor_strike") is not None
+         and float(m["floor_strike"]) > price
+         and float(m.get("no_ask", 100)) <= bid * 100],
+        key=lambda m: float(m["floor_strike"])  # closest above price first
     )[:3]
 
     logger.info(f"YES markets: {len(yes_markets)} | NO markets: {len(no_markets)}")
@@ -182,7 +183,7 @@ def webhook():
         asset     = data.get("asset", "BTC").upper()
         price     = float(data.get("price", 0))
 
-        # Convert UTC to EST
+        # Convert UTC to EST for schedule check
         now_utc  = datetime.utcnow()
         est_hour = (now_utc.hour - 5) % 24
         if now_utc.hour < 5:
